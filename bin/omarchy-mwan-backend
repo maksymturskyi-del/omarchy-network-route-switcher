@@ -1,0 +1,294 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+readonly CONFIG_FILE=/etc/omarchy-internet-route.conf
+readonly RUN_DIR=/run/omarchy-network-route-switcher
+readonly NFT_TABLE=omarchy_network_route_switcher
+readonly ETH_TABLE=42420
+readonly WIFI_TABLE=42421
+readonly ETH_MARK=0x4f4d01
+readonly WIFI_MARK=0x4f4d02
+readonly ETH_RULE_PRIORITY=10000
+readonly WIFI_RULE_PRIORITY=10001
+
+die() {
+  echo "omarchy-mwan-backend: $*" >&2
+  if declare -F clear_backend >/dev/null && [[ -e $RUN_DIR/installed || -e $RUN_DIR/rp-filter ]]; then
+    clear_backend
+  fi
+  exit 1
+}
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -r $CONFIG_FILE ]] || die "missing $CONFIG_FILE; run install.sh first"
+# This file is created root-owned by install.sh and contains only STATE_FILE.
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+[[ -n ${STATE_FILE:-} && $STATE_FILE == /* ]] || die "invalid STATE_FILE in $CONFIG_FILE"
+readonly IP_BIN=$(command -v ip) || die "iproute2 is required"
+mkdir -p /run/lock
+exec 9>/run/lock/omarchy-mwan.lock
+flock 9
+
+connected_device() {
+  local wanted=$1
+  nmcli -t -f DEVICE,TYPE,STATE device status |
+    awk -F: -v wanted="$wanted" '$2 == wanted && $3 == "connected" { print $1; exit }'
+}
+
+first_value() {
+  local value
+  value=$(nmcli --escape no -g "$1" device show "$2" 2>/dev/null | head -n 1 || true)
+  [[ $value == "--" ]] && value=
+  printf '%s' "$value"
+}
+
+remember_rp_filter() {
+  local dev=$1 saved=""
+  mkdir -p "$RUN_DIR"
+  touch "$RUN_DIR/rp-filter"
+  if ! awk -F '\t' -v dev="$dev" '$1 == dev { found=1 } END { exit !found }' "$RUN_DIR/rp-filter"; then
+    saved=$(sysctl -n "net.ipv4.conf.$dev.rp_filter")
+    printf '%s\t%s\n' "$dev" "$saved" >> "$RUN_DIR/rp-filter"
+  fi
+  sysctl -q -w "net.ipv4.conf.$dev.rp_filter=2"
+}
+
+delete_owned_rule() {
+  local family=$1 priority=$2 mark=$3 table=$4
+  while "$IP_BIN" -"$family" rule del priority "$priority" fwmark "$mark/0xffffffff" table "$table" 2>/dev/null; do :; done
+}
+
+clear_backend() {
+  local dev saved pid old_path old_group
+  # Put explicitly routed processes back where they came from before removing
+  # the temporary cgroups. Children that exited need no special handling.
+  if [[ -r $RUN_DIR/processes ]]; then
+    while IFS=$'\t' read -r pid old_path; do
+      [[ $pid =~ ^[0-9]+$ && -n $old_path && -d /proc/$pid ]] || continue
+      old_group="/sys/fs/cgroup${old_path}"
+      [[ -w $old_group/cgroup.procs ]] && printf '%s\n' "$pid" > "$old_group/cgroup.procs" 2>/dev/null || true
+    done < "$RUN_DIR/processes"
+  fi
+  if [[ -e $RUN_DIR/installed ]] && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    nft delete table inet "$NFT_TABLE"
+  fi
+  delete_owned_rule 4 "$ETH_RULE_PRIORITY" "$ETH_MARK" "$ETH_TABLE"
+  delete_owned_rule 4 "$WIFI_RULE_PRIORITY" "$WIFI_MARK" "$WIFI_TABLE"
+  delete_owned_rule 6 "$ETH_RULE_PRIORITY" "$ETH_MARK" "$ETH_TABLE"
+  delete_owned_rule 6 "$WIFI_RULE_PRIORITY" "$WIFI_MARK" "$WIFI_TABLE"
+  if [[ -e $RUN_DIR/installed || -e $RUN_DIR/rp-filter ]]; then
+    "$IP_BIN" -4 route flush table "$ETH_TABLE" >/dev/null 2>&1 || true
+    "$IP_BIN" -4 route flush table "$WIFI_TABLE" >/dev/null 2>&1 || true
+    "$IP_BIN" -6 route flush table "$ETH_TABLE" >/dev/null 2>&1 || true
+    "$IP_BIN" -6 route flush table "$WIFI_TABLE" >/dev/null 2>&1 || true
+  fi
+  if [[ -r $RUN_DIR/rp-filter ]]; then
+    while IFS=$'\t' read -r dev saved; do
+      [[ -n $dev && $saved =~ ^[0-2]$ ]] || continue
+      sysctl -q -w "net.ipv4.conf.$dev.rp_filter=$saved" 2>/dev/null || true
+    done < "$RUN_DIR/rp-filter"
+  fi
+  rm -rf "$RUN_DIR"
+  rmdir /sys/fs/cgroup/omarchy-network-route-switcher/ethernet /sys/fs/cgroup/omarchy-network-route-switcher/wifi /sys/fs/cgroup/omarchy-network-route-switcher 2>/dev/null || true
+}
+
+route_process() {
+  local pid_list=$1 target=$2 group pid old_path requester=${PKEXEC_UID:-}
+  local -a pids=() old_paths=()
+  [[ $pid_list =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "omarchy-mwan-backend: invalid process ID list" >&2; return 1; }
+  [[ $target == Ethernet || $target == Wi-Fi ]] || { echo "omarchy-mwan-backend: target must be Ethernet or Wi-Fi" >&2; return 1; }
+  [[ -e $RUN_DIR/installed ]] || { echo "omarchy-mwan-backend: Both must be active first" >&2; return 1; }
+  [[ $requester =~ ^[0-9]+$ ]] || { echo "omarchy-mwan-backend: missing requesting user identity" >&2; return 1; }
+  IFS=',' read -r -a pids <<< "$pid_list"
+  for pid in "${pids[@]}"; do
+    [[ -d /proc/$pid ]] || { echo "omarchy-mwan-backend: process $pid no longer exists" >&2; return 1; }
+    [[ $(stat -c %u "/proc/$pid" 2>/dev/null) == "$requester" ]] \
+      || { echo "omarchy-mwan-backend: process $pid is not owned by the requesting user" >&2; return 1; }
+    old_path=$(awk -F: '$1 == "0" { print $3; exit }' "/proc/$pid/cgroup")
+    [[ -n $old_path ]] || { echo "omarchy-mwan-backend: process $pid is not in a cgroup v2 hierarchy" >&2; return 1; }
+    old_paths+=("$old_path")
+  done
+  group=$([[ $target == Ethernet ]] && echo ethernet || echo wifi)
+  mkdir -p /sys/fs/cgroup/omarchy-network-route-switcher/ethernet /sys/fs/cgroup/omarchy-network-route-switcher/wifi
+  mkdir -p "$RUN_DIR"
+  for i in "${!pids[@]}"; do
+    pid=${pids[$i]}
+    old_path=${old_paths[$i]}
+    if ! awk -F'\t' -v pid="$pid" '$1 == pid { found=1 } END { exit !found }' "$RUN_DIR/processes" 2>/dev/null; then
+      printf '%s\t%s\n' "$pid" "$old_path" >> "$RUN_DIR/processes"
+    fi
+  done
+  for pid in "${pids[@]}"; do
+    printf '%s\n' "$pid" > "/sys/fs/cgroup/omarchy-network-route-switcher/$group/cgroup.procs"
+  done
+}
+
+reset_process_routes() {
+  local pid old_path old_group
+  [[ -r $RUN_DIR/processes ]] || return 0
+  while IFS=$'\t' read -r pid old_path; do
+    [[ $pid =~ ^[0-9]+$ && -n $old_path && -d /proc/$pid ]] || continue
+    old_group="/sys/fs/cgroup${old_path}"
+    [[ -w $old_group/cgroup.procs ]] && printf '%s\n' "$pid" > "$old_group/cgroup.procs" 2>/dev/null || true
+  done < "$RUN_DIR/processes"
+  rm -f "$RUN_DIR/processes"
+}
+
+apply_backend() {
+  local eth_dev wifi_dev eth_gw wifi_gw eth_addr wifi_addr
+  local eth_src wifi_src eth6_gw wifi6_gw eth6_src wifi6_src
+  local route_file
+  command -v nft >/dev/null || die "nftables is required"
+  command -v nmcli >/dev/null || die "NetworkManager is required"
+
+  # Rebuild our private policy tables from current NetworkManager state. Keep
+  # original rp_filter values until the user leaves Both.
+  [[ ! -e $RUN_DIR/installed ]] || clear_backend
+
+  eth_dev=$(connected_device ethernet)
+  wifi_dev=$(connected_device wifi)
+  if [[ -z $eth_dev || -z $wifi_dev ]]; then
+    clear_backend
+    echo "Both is selected; balancing will start when Ethernet and Wi-Fi are both connected." >&2
+    return 0
+  fi
+  [[ $eth_dev =~ ^[[:alnum:]_.:-]+$ && $wifi_dev =~ ^[[:alnum:]_.:-]+$ ]] || die "unsupported interface name"
+
+  eth_gw=$(first_value IP4.GATEWAY "$eth_dev")
+  wifi_gw=$(first_value IP4.GATEWAY "$wifi_dev")
+  eth_addr=$(first_value IP4.ADDRESS "$eth_dev")
+  wifi_addr=$(first_value IP4.ADDRESS "$wifi_dev")
+  if [[ -z $eth_gw || -z $wifi_gw || -z $eth_addr || -z $wifi_addr ]]; then
+    clear_backend
+    echo "Both is selected; balancing will start when both interfaces have an IPv4 gateway." >&2
+    return 0
+  fi
+  eth_src=${eth_addr%%/*}
+  wifi_src=${wifi_addr%%/*}
+  [[ $eth_gw =~ ^[0-9.]+$ && $wifi_gw =~ ^[0-9.]+$ ]] || die "invalid IPv4 gateway from NetworkManager"
+
+  local custom_rules
+  for family in 4 6; do
+    custom_rules=$("$IP_BIN" -"$family" rule show | awk -F: '$1+0 != 0 && $1+0 != 32766 && $1+0 != 32767 { print }')
+    [[ -z $custom_rules ]] || die "custom policy-routing rules are active; disable the VPN or other policy-routing tool before using Both"
+  done
+
+  # Refuse table collisions before touching sysctl or route state.
+  if [[ ! -e $RUN_DIR/installed ]]; then
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      die "nftables table $NFT_TABLE is already in use"
+    fi
+    table_routes=$("$IP_BIN" -4 route show table "$ETH_TABLE" 2>/dev/null || true; "$IP_BIN" -6 route show table "$ETH_TABLE" 2>/dev/null || true)
+    [[ -z $table_routes ]] || die "routing table $ETH_TABLE is already in use"
+    table_routes=$("$IP_BIN" -4 route show table "$WIFI_TABLE" 2>/dev/null || true; "$IP_BIN" -6 route show table "$WIFI_TABLE" 2>/dev/null || true)
+    [[ -z $table_routes ]] || die "routing table $WIFI_TABLE is already in use"
+    mkdir -p "$RUN_DIR"
+    touch "$RUN_DIR/installed"
+  fi
+
+  mkdir -p "$RUN_DIR"
+  remember_rp_filter "$eth_dev"
+  remember_rp_filter "$wifi_dev"
+
+  # Preserve non-default routes (LANs, VPNs, and static routes) in both
+  # policy tables. A third default route is ambiguous, so refuse it below.
+  while IFS= read -r route_line; do
+    [[ -n $route_line && $route_line != default* ]] || continue
+    local -a route=()
+    read -r -a route <<< "$route_line"
+    for table in "$ETH_TABLE" "$WIFI_TABLE"; do
+      "$IP_BIN" -4 route replace "${route[@]}" table "$table"
+    done
+  done < <("$IP_BIN" -4 route show table main)
+
+  local extra_default
+  extra_default=$("$IP_BIN" -4 route show default | awk -v eth="$eth_dev" -v wifi="$wifi_dev" '{ dev=""; for (i=1;i<=NF;i++) if ($i=="dev") dev=$(i+1); if (dev != eth && dev != wifi) print }')
+  [[ -z $extra_default ]] || die "a third default route is active; disable the VPN/other uplink before using Both"
+  "$IP_BIN" -4 route replace default via "$eth_gw" dev "$eth_dev" src "$eth_src" table "$ETH_TABLE"
+  "$IP_BIN" -4 route replace default via "$wifi_gw" dev "$wifi_dev" src "$wifi_src" table "$WIFI_TABLE"
+
+  eth6_gw=$("$IP_BIN" -6 route show default dev "$eth_dev" | awk 'NR==1 { for (i=1;i<=NF;i++) if ($i=="via") { print $(i+1); exit } }')
+  wifi6_gw=$("$IP_BIN" -6 route show default dev "$wifi_dev" | awk 'NR==1 { for (i=1;i<=NF;i++) if ($i=="via") { print $(i+1); exit } }')
+  eth6_src=$("$IP_BIN" -6 -o addr show dev "$eth_dev" scope global | awk 'NR==1 { sub("/.*", "", $4); print $4 }')
+  wifi6_src=$("$IP_BIN" -6 -o addr show dev "$wifi_dev" scope global | awk 'NR==1 { sub("/.*", "", $4); print $4 }')
+  if [[ -n $eth6_gw && -n $wifi6_gw && -n $eth6_src && -n $wifi6_src ]]; then
+    while IFS= read -r route_line; do
+      [[ -n $route_line && $route_line != default* ]] || continue
+      local -a route=()
+      read -r -a route <<< "$route_line"
+      for table in "$ETH_TABLE" "$WIFI_TABLE"; do
+        "$IP_BIN" -6 route replace "${route[@]}" table "$table"
+      done
+    done < <("$IP_BIN" -6 route show table main)
+    "$IP_BIN" -6 route replace default via "$eth6_gw" dev "$eth_dev" src "$eth6_src" table "$ETH_TABLE"
+    "$IP_BIN" -6 route replace default via "$wifi6_gw" dev "$wifi_dev" src "$wifi6_src" table "$WIFI_TABLE"
+    extra_default=$("$IP_BIN" -6 route show default | awk -v eth="$eth_dev" -v wifi="$wifi_dev" '{ dev=""; for (i=1;i<=NF;i++) if ($i=="dev") dev=$(i+1); if (dev != eth && dev != wifi) print }')
+    [[ -z $extra_default ]] || die "a third IPv6 default route is active; disable the VPN/other uplink before using Both"
+    touch "$RUN_DIR/ipv6"
+  else
+    rm -f "$RUN_DIR/ipv6"
+  fi
+
+  for family in 4 6; do
+    [[ $family == 6 && ! -e $RUN_DIR/ipv6 ]] && continue
+    delete_owned_rule "$family" "$ETH_RULE_PRIORITY" "$ETH_MARK" "$ETH_TABLE"
+    delete_owned_rule "$family" "$WIFI_RULE_PRIORITY" "$WIFI_MARK" "$WIFI_TABLE"
+    "$IP_BIN" -"$family" rule add priority "$ETH_RULE_PRIORITY" fwmark "$ETH_MARK/0xffffffff" table "$ETH_TABLE"
+    "$IP_BIN" -"$family" rule add priority "$WIFI_RULE_PRIORITY" fwmark "$WIFI_MARK/0xffffffff" table "$WIFI_TABLE"
+  done
+
+  route_file=$(mktemp)
+  mkdir -p /sys/fs/cgroup/omarchy-network-route-switcher/ethernet /sys/fs/cgroup/omarchy-network-route-switcher/wifi
+  {
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      echo "delete table inet $NFT_TABLE"
+    fi
+    cat <<EOF
+add table inet $NFT_TABLE
+add chain inet $NFT_TABLE incoming { type filter hook prerouting priority mangle; policy accept; }
+add chain inet $NFT_TABLE outgoing { type route hook output priority mangle; policy accept; }
+add rule inet $NFT_TABLE incoming iifname "$eth_dev" ct state new ct mark 0 ct mark set $ETH_MARK
+add rule inet $NFT_TABLE incoming iifname "$wifi_dev" ct state new ct mark 0 ct mark set $WIFI_MARK
+add rule inet $NFT_TABLE outgoing socket cgroupv2 level 2 "omarchy-network-route-switcher/ethernet" ct state new ct mark 0 meta mark set $ETH_MARK ct mark set meta mark
+add rule inet $NFT_TABLE outgoing socket cgroupv2 level 2 "omarchy-network-route-switcher/wifi" ct state new ct mark 0 meta mark set $WIFI_MARK ct mark set meta mark
+add rule inet $NFT_TABLE outgoing ct state new ct mark 0 meta mark 0 ct mark set numgen inc mod 2 map { 0 : $ETH_MARK, 1 : $WIFI_MARK }
+add rule inet $NFT_TABLE outgoing ct mark != 0 meta mark set ct mark
+EOF
+  } > "$route_file"
+  nft -f "$route_file"
+  rm -f "$route_file"
+  printf '%s\n' "$eth_dev" "$wifi_dev" > "$RUN_DIR/interfaces"
+  touch "$RUN_DIR/installed"
+  echo "Both: new connections are distributed across $eth_dev and $wifi_dev"
+}
+
+sync_backend() {
+  local mode=""
+  [[ -r $STATE_FILE ]] && mode=$(head -n 1 "$STATE_FILE" | tr -d '[:space:]')
+  if [[ $mode == Both ]]; then
+    apply_backend
+  else
+    clear_backend
+  fi
+}
+
+case ${1:-} in
+  apply)
+    trap 'status=$?; trap - ERR; clear_backend; exit "$status"' ERR
+    apply_backend
+    trap - ERR
+    ;;
+  clear) clear_backend ;;
+  route-process)
+    [[ $# -eq 3 ]] || die "usage: $0 route-process PID Ethernet|Wi-Fi"
+    route_process "$2" "$3"
+    ;;
+  reset-process-routes) reset_process_routes ;;
+  sync)
+    trap 'status=$?; trap - ERR; clear_backend; exit "$status"' ERR
+    sync_backend
+    trap - ERR
+    ;;
+  *) die "usage: $0 {apply|clear|sync}" ;;
+esac

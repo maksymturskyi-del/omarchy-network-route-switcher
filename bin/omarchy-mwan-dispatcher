@@ -1,0 +1,9 @@
+#!/usr/bin/bash
+set -u
+
+case ${2:-} in
+  up|down|dhcp4-change|dhcp6-change|connectivity-change) ;;
+  *) exit 0 ;;
+esac
+
+exec /usr/local/libexec/omarchy-mwan-backend sync >/dev/null 2>&1

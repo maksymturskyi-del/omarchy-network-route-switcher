@@ -1,0 +1,237 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE_FILE="$HOME/.config/omarchy/network-route.mode"
+POLICY_FILE="$HOME/.config/omarchy/network-route.both-policy"
+BACKEND="/usr/local/libexec/omarchy-mwan-backend"
+
+run_backend() {
+  local action=$1
+  shift
+  [[ -x $BACKEND ]] || { echo "Both mode backend missing; run ./install.sh first" >&2; return 1; }
+  command -v pkexec >/dev/null || { echo "pkexec is required for privileged route setup" >&2; return 1; }
+  pkexec "$BACKEND" "$action" "$@"
+}
+
+list_processes() {
+  local pid name exe path route
+  local -A window_pids=()
+  if command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    while IFS= read -r pid; do
+      [[ $pid =~ ^[0-9]+$ ]] && window_pids[$pid]=1
+    done < <(hyprctl clients -j 2>/dev/null | jq -r '.[].pid // empty' 2>/dev/null || true)
+  fi
+  for proc in /proc/[0-9]*; do
+    pid=${proc##*/}
+    [[ -r $proc/comm && -r $proc/cgroup ]] || continue
+    [[ $(stat -c %u "$proc" 2>/dev/null || true) == "$UID" ]] || continue
+    exe=$(readlink -f "$proc/exe" 2>/dev/null || true)
+    name=${exe##*/}
+    name=${name% (deleted)}
+    [[ -n $name ]] || { IFS= read -r name < "$proc/comm" || continue; }
+    path=$(awk -F: '$1 == "0" { print $3; exit }' "$proc/cgroup")
+    route=""
+    case "$path" in
+      /omarchy-network-route-switcher/ethernet) route="Ethernet" ;;
+      /omarchy-network-route-switcher/wifi) route="Wi-Fi" ;;
+    esac
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$name" "$route" "${window_pids[$pid]:-}"
+  done | sort -k2,2f -k1,1n
+}
+
+clear_balancer_if_active() {
+  [[ ! -x $BACKEND || ! -e /run/omarchy-network-route-switcher/installed ]] || run_backend clear
+}
+
+get_wifi_conns() {
+  nmcli -t -f UUID,TYPE connection show | awk -F: '$2 == "802-11-wireless" { print $1 }'
+}
+
+get_eth_conns() {
+  nmcli -t -f UUID,TYPE connection show | awk -F: '$2 == "802-3-ethernet" { print $1 }'
+}
+
+reapply_active() {
+  while IFS=: read -r dev type state; do
+    [[ -n $dev && $state == "connected" ]] || continue
+    case "$type" in
+      wifi|ethernet)
+        nmcli device reapply "$dev" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < <(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null || true)
+}
+
+detect_current_mode() {
+  if [[ -f "$STATE_FILE" ]]; then
+    local saved
+    saved=$(head -n 1 "$STATE_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$saved" in
+      Auto|Ethernet|Wi-Fi|Both)
+        echo "$saved"
+        return 0
+        ;;
+    esac
+  fi
+
+  # Check active Wi-Fi settings
+  local wifi_uuid
+  wifi_uuid=$(get_wifi_conns | head -n 1)
+  if [[ -n "$wifi_uuid" ]]; then
+    local never
+    never=$(nmcli -g ipv4.never-default connection show "$wifi_uuid" 2>/dev/null || true)
+    if [[ "$never" == "yes" ]]; then
+      echo "Ethernet"
+      return 0
+    fi
+    local metric
+    metric=$(nmcli -g ipv4.route-metric connection show "$wifi_uuid" 2>/dev/null || true)
+    if [[ "$metric" == "50" ]]; then
+      echo "Wi-Fi"
+      return 0
+    fi
+  fi
+
+  echo "Auto"
+}
+
+set_mode() {
+  local mode="$1"
+  local wifi_uuids eth_uuids
+
+  wifi_uuids=$(get_wifi_conns)
+  eth_uuids=$(get_eth_conns)
+
+  case "$mode" in
+    Auto|auto)
+      mode="Auto"
+      clear_balancer_if_active
+      for uuid in $wifi_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 600 \
+          ipv6.route-metric 600 || { echo "Failed to update Wi-Fi profile $uuid" >&2; exit 1; }
+      done
+      for uuid in $eth_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 100 \
+          ipv6.route-metric 100 || { echo "Failed to update Ethernet profile $uuid" >&2; exit 1; }
+      done
+      ;;
+
+    Ethernet|ethernet)
+      mode="Ethernet"
+      clear_balancer_if_active
+      # Wi-Fi is LAN only (never-default yes)
+      for uuid in $wifi_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default yes \
+          ipv6.never-default yes \
+          ipv4.route-metric 600 \
+          ipv6.route-metric 600 || { echo "Failed to update Wi-Fi profile $uuid" >&2; exit 1; }
+      done
+      # Ethernet is default
+      for uuid in $eth_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 100 \
+          ipv6.route-metric 100 || { echo "Failed to update Ethernet profile $uuid" >&2; exit 1; }
+      done
+      ;;
+
+    Wi-Fi|wifi|WiFi)
+      mode="Wi-Fi"
+      clear_balancer_if_active
+      # Wi-Fi is primary default route
+      for uuid in $wifi_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 50 \
+          ipv6.route-metric 50 || { echo "Failed to update Wi-Fi profile $uuid" >&2; exit 1; }
+      done
+      # Ethernet has higher metric so Wi-Fi takes priority, but Ethernet remains active as LAN/fallback
+      for uuid in $eth_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 2000 \
+          ipv6.route-metric 2000 || { echo "Failed to update Ethernet profile $uuid" >&2; exit 1; }
+      done
+      ;;
+
+    Both|both)
+      mode="Both"
+      [[ -x $BACKEND ]] || { echo "Both mode requires the backend; run ./install.sh first" >&2; exit 1; }
+      # The kernel backend balances new flows; keep normal metrics as a
+      # fallback while either physical link is down.
+      for uuid in $wifi_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 600 \
+          ipv6.route-metric 600 || { echo "Failed to update Wi-Fi profile $uuid" >&2; exit 1; }
+      done
+      for uuid in $eth_uuids; do
+        nmcli connection modify "$uuid" \
+          ipv4.never-default no \
+          ipv6.never-default no \
+          ipv4.route-metric 100 \
+          ipv6.route-metric 100 || { echo "Failed to update Ethernet profile $uuid" >&2; exit 1; }
+      done
+      mkdir -p "$(dirname "$STATE_FILE")"
+      echo "$mode" > "$STATE_FILE"
+      reapply_active
+      if ! run_backend apply; then
+        printf 'Auto\n' > "$STATE_FILE"
+        echo "Both setup failed; profile metrics remain at Auto defaults." >&2
+        exit 1
+      fi
+      echo "$mode"
+      return 0
+      ;;
+
+    sync)
+      mode=$(detect_current_mode)
+      if [[ "$mode" == Both ]]; then
+        run_backend sync
+        echo Both
+        return 0
+      fi
+      clear_balancer_if_active
+      mode="Auto"
+      ;;
+
+    *)
+      echo "Unknown mode: $mode. Valid: Auto, Ethernet, Wi-Fi, Both" >&2
+      exit 1
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$STATE_FILE")"
+  echo "$mode" > "$STATE_FILE"
+  reapply_active
+  echo "$mode"
+}
+
+if [[ $# -eq 0 ]]; then
+  detect_current_mode
+elif [[ $1 == processes && $# -eq 1 ]]; then
+  list_processes
+elif [[ $1 == process-route && $# -eq 3 ]]; then
+  run_backend route-process "$2" "$3"
+elif [[ $1 == process-reset && $# -eq 1 ]]; then
+  run_backend reset-process-routes
+elif [[ $1 == both-policy && $# -eq 1 ]]; then
+  [[ -r $POLICY_FILE ]] && cat "$POLICY_FILE" || echo Auto
+elif [[ $1 == both-policy && $# -eq 2 && ( $2 == Auto || $2 == Manual ) ]]; then
+  mkdir -p "$(dirname "$POLICY_FILE")"
+  printf '%s\n' "$2" > "$POLICY_FILE"
+  echo "$2"
+else
+  set_mode "$1"
+fi

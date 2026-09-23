@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "maksymturskyi-del.network-route-switcher",
+  "name": "Internet Route Switcher",
+  "version": "1.0.0",
+  "author": "Maksym Turskyi",
+  "description": "Choose Ethernet, Wi-Fi, or per-connection routing across both links",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Internet Route Switcher",
+    "description": "Choose Ethernet, Wi-Fi, or balance new connections across both",
+    "category": "Network",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.network"
+  }
+}

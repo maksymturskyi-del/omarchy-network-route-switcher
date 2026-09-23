@@ -1,0 +1,7 @@
+This project contains a modified copy of the Omarchy Shell network panel
+(Panel.qml and Model.js), originally from:
+https://github.com/omacom/omarchy/tree/quattro/shell/plugins/panels/network
+
+The upstream Omarchy project is copyright David Heinemeier Hansson and is
+distributed under the MIT License. The upstream copyright and license notice
+is retained in LICENSE. Changes specific to this project are by Maksym Turskyi.
